@@ -16,7 +16,7 @@ from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
 from typing import Tuple, Union, List
-
+from nnunetv2.training.loss.weighted_losses import WeightedDC_and_CE, VesselLoss
 import numpy as np
 import torch
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
@@ -145,7 +145,7 @@ class dinov3Trainer(nnUNetTrainer):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 100 #1000
         self.current_epoch = 0
         self.enable_deep_supervision = False
 
@@ -309,7 +309,7 @@ class dinov3Trainer(nnUNetTrainer):
         model = vit_base(drop_path_rate=0.2, layerscale_init=1.0e-05)
         # Load checkpoint
         chkpt = torch.load(
-            '/scr2/yl_li/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth',
+            r'C:\Users\asage\Documents\.ABM\MedDINOv3\model.pth',
             map_location='cpu'
         )
         # Load with strict=False so it won’t crash on mismatches
@@ -372,7 +372,7 @@ class dinov3Trainer(nnUNetTrainer):
             self.batch_size = batch_size_per_GPU[my_rank]
             self.oversample_foreground_percent = oversample_percent
 
-    def _build_loss(self):
+    """def _build_loss(self):
         if self.label_manager.has_regions:
             loss = DC_and_BCE_loss({},
                                    {'batch_dice': self.configuration_manager.batch_dice,
@@ -406,8 +406,122 @@ class dinov3Trainer(nnUNetTrainer):
             # now wrap the loss
             loss = DeepSupervisionWrapper(loss, weights)
 
-        return loss
+        return loss"""
 
+    """"def _build_loss(self):
+        if self.label_manager.has_regions:
+            loss = DC_and_BCE_loss({},
+                                   {'batch_dice': self.configuration_manager.batch_dice,
+                                    'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
+                                   use_ignore_label=self.label_manager.ignore_label is not None,
+                                   dice_class=MemoryEfficientSoftDiceLoss)
+        else:
+            loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
+                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
+                                  ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
+
+        if self._do_i_compile():
+            loss.dc = torch.compile(loss.dc)
+
+        # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
+        # this gives higher resolution outputs more weight in the loss
+
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            if self.is_ddp and not self._do_i_compile():
+                # very strange and stupid interaction. DDP crashes and complains about unused parameters due to
+                # weights[-1] = 0. Interestingly this crash doesn't happen with torch.compile enabled. Strange stuff.
+                # Anywho, the simple fix is to set a very low weight to this.
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+
+            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+            weights = weights / weights.sum()
+            # now wrap the loss
+            loss = DeepSupervisionWrapper(loss, weights)
+
+        return loss"""
+    
+    def _build_loss(self):
+        # ======================================================
+        # 1. BASE nnU-Net LOSS
+        # ======================================================
+        if self.label_manager.has_regions:
+            loss = DC_and_BCE_loss(
+                {},
+                {
+                    'batch_dice': self.configuration_manager.batch_dice,
+                    'do_bg': True,
+                    'smooth': 1e-5,
+                    'ddp': self.is_ddp
+                },
+                use_ignore_label=self.label_manager.ignore_label is not None,
+                dice_class=MemoryEfficientSoftDiceLoss
+            )
+        else:
+            loss = DC_and_CE_loss(
+                {
+                    'batch_dice': self.configuration_manager.batch_dice,
+                    'smooth': 1e-5,
+                    'do_bg': False,
+                    'ddp': self.is_ddp
+                },
+                {},
+                weight_ce=1,
+                weight_dice=1,
+                ignore_label=self.label_manager.ignore_label,
+                dice_class=MemoryEfficientSoftDiceLoss
+            )
+
+        # ======================================================
+        # 2. OPTIONAL: torch.compile safety
+        # ======================================================
+        if self._do_i_compile():
+            loss.dc = torch.compile(loss.dc)
+
+        # ======================================================
+        # 3. CUSTOM (THIS IS THE IMPORTANT PART)
+        # ======================================================
+
+        # ---- class weights (simple baseline for 25 classes)
+        num_classes = self.label_manager.num_segmentation_heads
+        class_weights = np.ones(num_classes, dtype=np.float32)
+
+        # normalize (safe default, prevents scale explosion)
+        class_weights = class_weights / (class_weights.sum() + 1e-8)
+
+        # ---- import your custom loss wrapper
+        from nnunetv2.training.loss.weighted_losses import VesselLoss
+
+        loss = VesselLoss(
+            base_loss=loss,
+            class_weights=class_weights,
+            boundary_weight=0.1   # start small (0.05–0.1 recommended)
+        )
+
+        # ======================================================
+        # 4. DEEP SUPERVISION (nnU-Net standard)
+        # ======================================================
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+
+            if self.is_ddp and not self._do_i_compile():
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+
+            # normalize
+            weights = weights / weights.sum()
+
+            # IMPORTANT: wrap AFTER your custom loss
+            loss = DeepSupervisionWrapper(loss, weights)
+
+        return loss
+    
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
         """
         This function is stupid and certainly one of the weakest spots of this implementation. Not entirely sure how we can fix it.
@@ -1374,7 +1488,7 @@ class dinov3_base_sam_Trainer(dinov3Trainer):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 100 #1000 
         self.current_epoch = 0
         self.enable_deep_supervision = False
 
@@ -1415,7 +1529,7 @@ class dinov3_base_primus_Trainer(dinov3Trainer):
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
         self.warmup_epochs = 0
-        self.num_epochs = 1000
+        self.num_epochs = 100
         self.current_epoch = 0
         self.enable_deep_supervision = False
 
@@ -1490,7 +1604,7 @@ class dinov3_base_primus_Trainer_scratch(dinov3_base_primus_Trainer):
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
         self.warmup_epochs = 0
-        self.num_epochs = 1000
+        self.num_epochs = 100
         self.current_epoch = 0
         self.enable_deep_supervision = False
 
@@ -1526,7 +1640,7 @@ class dinov3_base_primus_multiscale_Trainer(dinov3_base_primus_Trainer):
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
         self.warmup_epochs = 0
-        self.num_epochs = 1000
+        self.num_epochs = 100
         self.current_epoch = 0
         self.enable_deep_supervision = False
 
@@ -1569,26 +1683,28 @@ class meddinov3_base_primus_multiscale_Trainer(dinov3_base_primus_Trainer):
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
         self.warmup_epochs = 0
-        self.num_epochs = 1000
+        self.num_epochs = 100
         self.current_epoch = 0
         self.enable_deep_supervision = False
 
     @staticmethod
-    def build_network_architecture(patch_size: tuple, 
+    def build_network_architecture(patch_size: tuple,
                                    architecture_class_name: str,
                                    arch_init_kwargs: dict,
                                    arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                    num_input_channels: int,
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True) -> nn.Module:
-    
+        #
         from nnunetv2.training.nnUNetTrainer.dinov3.dinov3.models.vision_transformer import vit_base
         # Initialize MedDINOv3 model.
+
+        
         model = vit_base(drop_path_rate=0.2, layerscale_init=1.0e-05, n_storage_tokens=4, 
                          qkv_bias = False, mask_k_bias= True)
         # Load checkpoint (remember to download our checkpoint)
         chkpt = torch.load(
-            '/scr2/yl_li/dinov3/public_release/ct_model_vitb_batch_512_adapt_high_res/model.pth',
+            r'C:\Users\asage\Documents\.ABM\MedDINOv3\model.pth',
             map_location='cpu'
         )
         state_dict = chkpt['teacher']
